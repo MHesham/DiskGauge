@@ -26,21 +26,34 @@ public:
     {
         LogInfo("DiskGauge built " __TIMESTAMP__);
 
-        DiskGauage gauge;
+        DiskGauage dg;
 
-        if (argc != 2) {
+        if (argc < 3) {
             DiskGauage::usage();
             return 0;
         }
 
         wchar_t* physicalDiskPath(argv[1]);
-        gauge.Run(physicalDiskPath);
+        dg.Init(physicalDiskPath);
 
-        LogInfo("Exiting");
+        if (!wcscmp(argv[2], L"-g")) {
+            dg.gauge();
+        } else if (!wcscmp(argv[2], L"-b")) {
+            if (argc < 4) {
+                dg.usage();
+                return 0;
+            }
+
+            LONGLONG sectorIdx = std::stoll(wstring(argv[3]));
+            dg.burn(sectorIdx);
+        } else {
+            dg.usage();
+        }
+
         return 0;
     }
 
-    void Run(wchar_t* physicalDiskPath)
+    void Init(wchar_t* physicalDiskPath)
     {
         LogInfo("Physical Disk Path: %s", physicalDiskPath);
 
@@ -67,14 +80,6 @@ public:
             (ULONG)diskGeometry.TracksPerCylinder *
             (ULONG)diskGeometry.SectorsPerTrack;
 
-        gauge();
-    }
-
-private:
-
-    void gauge()
-    {
-        LogInfo("Gauging disk start for %lld sectors", sectorsCount);
         LogInfo("Boosting process class and thread priority");
 
         if (!SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS)) {
@@ -86,6 +91,79 @@ private:
             LogError("SetThreadPriority failed. Error = %ld", GetLastError());
             return;
         }
+    }
+
+private:
+
+    void burn(LONGLONG sectorIdx)
+    {
+        LogInfo("Burn start for sector %lld", sectorIdx);
+
+        const LONGLONG maxCycles = 1000000;
+        const size_t sectorBufferSize = diskGeometry.BytesPerSector;
+        unique_ptr<BYTE[]> writeBuffer(new BYTE[sectorBufferSize]);
+        unique_ptr<BYTE[]> readBuffer(new BYTE[sectorBufferSize]);
+        DWORD numBytesWritten;
+        LARGE_INTEGER distanceToMove;
+        distanceToMove.QuadPart = sectorIdx * diskGeometry.BytesPerSector;
+
+        for (LONGLONG cycle = 0; cycle < maxCycles; ++cycle) {
+            if (!GenerateRandomDataBuffer(writeBuffer.get(), sectorBufferSize)) {
+                LogError("Failed to generate random buffer");
+                return;
+            }
+
+            if (!SetFilePointerEx(diskHandle, distanceToMove, NULL, FILE_BEGIN)) {
+                LogError("SetFilePointerEx failed. Error = %ld", GetLastError());
+            }
+
+            if (!WriteFile(
+                diskHandle,
+                writeBuffer.get(),
+                sectorBufferSize,
+                &numBytesWritten,
+                NULL)) {
+                LogError(
+                    "WriteFile failed at sector#%lld. Error = %ld",
+                    sectorIdx,
+                    GetLastError());
+                break;
+            }
+
+            if (!SetFilePointerEx(diskHandle, distanceToMove, NULL, FILE_BEGIN)) {
+                LogError("SetFilePointerEx failed. Error = %ld", GetLastError());
+                break;
+            }
+
+            if (!ReadFile(
+                diskHandle,
+                readBuffer.get(),
+                sectorBufferSize,
+                &numBytesWritten,
+                NULL)) {
+                LogError(
+                    "WriteFile failed at sector#%lld. Error = %ld",
+                    sectorIdx,
+                    GetLastError());
+            }
+
+            if (!isBuffersIdentical(writeBuffer.get(), readBuffer.get(), sectorBufferSize)) {
+                LogError("Binary integrity failed at sector#%lld", sectorIdx);
+                break;
+            }
+
+            // Display statistics every 512 block
+            if (sectorIdx % 1000 == 0) {
+                LogInfo(
+                    "Burnt %lld write/read cycle(s)",
+                    cycle + 1);
+            }
+        }
+    }
+
+    void gauge()
+    {
+        LogInfo("Gauging disk start for %lld sectors", sectorsCount);
 
         const size_t sectorBufferSize = diskGeometry.BytesPerSector;
         unique_ptr<BYTE[]> writeBuffer(new BYTE[sectorBufferSize]);
@@ -190,12 +268,12 @@ private:
     {
         DWORD dummy = 0;
         return DeviceIoControl(diskHandle,
-                               IOCTL_DISK_GET_DRIVE_GEOMETRY,
-                               NULL, 0,
-                               &diskGeometry,
-                               sizeof(diskGeometry),
-                               &dummy,
-                               (LPOVERLAPPED)NULL);
+            IOCTL_DISK_GET_DRIVE_GEOMETRY,
+            NULL, 0,
+            &diskGeometry,
+            sizeof(diskGeometry),
+            &dummy,
+            (LPOVERLAPPED)NULL);
     }
 
     void printDiskGeometry()
@@ -212,8 +290,8 @@ private:
             (ULONG)diskGeometry.BytesPerSector;
 
         LogInfo("Disk size       = %I64d (Bytes)\n"
-                "                = %.2f (GB)",
-                DiskSize, (double)DiskSize / (1024 * 1024 * 1024));
+            "                = %.2f (GB)",
+            DiskSize, (double)DiskSize / (1024 * 1024 * 1024));
     }
 
     static void usage()
