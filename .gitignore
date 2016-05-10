@@ -26,3 +26,9 @@
 *.exe
 *.out
 *.app
+
+*.user
+Release/
+Debug/
+ARM/
+.vs/
