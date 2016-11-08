@@ -33,18 +33,20 @@ public:
             enum {
                 ListDisks,
                 Gauge,
-                Burn
+                Burn,
+                DD
             } Command;
             LONGLONG SectorIdx;
         } params;
 
-
-        if (!wcscmp(argv[1], L"-l")) {
+        if (!_wcsicmp(argv[1], L"-l")) {
             params.Command = _PARAMS::ListDisks;
-        } else if (!wcscmp(argv[1], L"-g")) {
+        } else if (!_wcsicmp(argv[1], L"-g")) {
             params.Command = _PARAMS::Gauge;
-        } else if (!wcscmp(argv[2], L"-b")) {
+        } else if (!_wcsicmp(argv[1], L"-b")) {
             params.Command = _PARAMS::Burn;
+        } else if (!_wcsicmp(argv[1], L"-dd")) {
+            params.Command = _PARAMS::DD;
         } else {
             dg.usage();
             return 0;
@@ -57,6 +59,7 @@ public:
 
         case _PARAMS::Gauge:
         case _PARAMS::Burn:
+        case _PARAMS::DD:
             if (argc < 3) {
                 DiskGauage::usage();
                 return 0;
@@ -64,11 +67,27 @@ public:
 
             params.PhysicalDiskPath = argv[2];
 
-            if (params.Command == _PARAMS::Gauge) {
+            switch (params.Command) {
+            case _PARAMS::Gauge:
                 dg.gauge(params.PhysicalDiskPath);
-            } else {
+                break;
+
+            case _PARAMS::Burn:
+                if (argc < 4) {
+                    DiskGauage::usage();
+                    return 0;
+                }
                 params.SectorIdx = std::stoll(wstring(argv[3]));
                 dg.burn(params.PhysicalDiskPath, params.SectorIdx);
+                break;
+
+            case _PARAMS::DD:
+                if (argc < 5) {
+                    DiskGauage::usage();
+                    return 0;
+                }
+                params.SectorIdx = std::stoll(wstring(argv[3]));
+                dg.dd(params.PhysicalDiskPath, params.SectorIdx, argv[4]);
             }
             break;
 
@@ -115,6 +134,124 @@ private:
             if (Verbose) {
                 LogError("CreateFile failed. Error = %ld", GetLastError());
             }
+            return false;
+        }
+
+        return true;
+    }
+
+    bool dd(wchar_t* PhysicalDiskPath, LONGLONG SectorIdx, wchar_t* Filename)
+    {
+        LogInfo("DD %s starting from sector %lld on %s", Filename, SectorIdx, PhysicalDiskPath);
+
+        if (!openPhysicalDisk(PhysicalDiskPath, true)) {
+            return false;
+        }
+
+        if (!getDiskGeometry()) {
+            return false;
+        }
+
+        printDiskGeometry();
+
+        DWORD bufferSize;
+        auto fileBuffer = readFileIntoMemory(Filename, &bufferSize);
+        if (fileBuffer.get() == nullptr) {
+            LogError("readFileIntoMemory failed");
+            return false;
+        }
+
+        if (!writeBufferToDisk(SectorIdx, fileBuffer.get(), bufferSize)) {
+            LogError("writeBufferToDisk failed");
+            return false;
+        }
+
+        LogInfo("Done!");
+
+        return true;
+    }
+
+    class AutoHandle
+    {
+    public:
+        AutoHandle(HANDLE Handle) : InnerHandle(Handle) {}
+        AutoHandle() : InnerHandle(NULL) {}
+        ~AutoHandle()
+        {
+            if (InnerHandle != NULL) {
+                CloseHandle(InnerHandle);
+                InnerHandle = NULL;
+            }
+        }
+        HANDLE Get() const { return InnerHandle; }
+
+    private:
+        HANDLE InnerHandle;
+    };
+
+    unique_ptr<BYTE[]> readFileIntoMemory(wchar_t* Filename, DWORD* BufferSize)
+    {
+        AutoHandle fileHandle(
+            CreateFile(
+                Filename,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_EXISTING,
+                0,
+                NULL));
+        if (fileHandle.Get() == INVALID_HANDLE_VALUE) {
+            LogError("CreateFile(%s) failed. Error = %ld", Filename, GetLastError());
+            return false;
+        }
+
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(fileHandle.Get(), &fileSize)) {
+            LogError("GetFileSizeEx failed. Error = %ld", GetLastError());
+            return false;
+        }
+
+        unique_ptr<BYTE[]> fileBuffer(new BYTE[fileSize.LowPart]);
+        DWORD numBytesWritten;
+
+        if (!ReadFile(
+            fileHandle.Get(),
+            fileBuffer.get(),
+            fileSize.LowPart,
+            &numBytesWritten,
+            NULL)) {
+            LogError("ReadFile failed. Error = %ld", GetLastError());
+            return false;
+        }
+
+        if (BufferSize != nullptr) {
+            *BufferSize = fileSize.LowPart;
+        }
+
+        return fileBuffer;
+    }
+
+    bool writeBufferToDisk(LONGLONG SectorIdx, BYTE* BufferPtr, DWORD BufferSize)
+    {
+        DWORD numBytesWritten;
+        LARGE_INTEGER distanceToMove;
+        distanceToMove.QuadPart = SectorIdx * diskGeometry.BytesPerSector;
+
+        if (!SetFilePointerEx(diskHandle, distanceToMove, NULL, FILE_BEGIN)) {
+            LogError("SetFilePointerEx failed. Error = %ld", GetLastError());
+            return false;
+        }
+
+        if (!WriteFile(
+            diskHandle,
+            BufferPtr,
+            BufferSize,
+            &numBytesWritten,
+            NULL)) {
+            LogError(
+                "WriteFile failed at sector#%lld. Error = %ld",
+                SectorIdx,
+                GetLastError());
             return false;
         }
 
@@ -196,7 +333,7 @@ private:
                     stats.AvgSectorReadTimeUs);
             }
         }
-        
+
         return true;
     }
 
@@ -250,7 +387,7 @@ private:
             &numBytesWritten,
             NULL)) {
             LogError(
-                "WriteFile failed at sector#%lld. Error = %ld",
+                "ReadFile failed at sector#%lld. Error = %ld",
                 SectorIdx,
                 GetLastError());
             return false;
@@ -294,12 +431,12 @@ private:
     {
         DWORD bytesReturned = 0;
         if (!DeviceIoControl(diskHandle,
-            IOCTL_DISK_GET_DRIVE_GEOMETRY,
-            NULL, 0,
-            &diskGeometry,
-            sizeof(diskGeometry),
-            &bytesReturned,
-            (LPOVERLAPPED)NULL)) {
+                             IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                             NULL, 0,
+                             &diskGeometry,
+                             sizeof(diskGeometry),
+                             &bytesReturned,
+                             (LPOVERLAPPED)NULL)) {
             LogError("DeviceIoControl(IOCTL_DISK_GET_DRIVE_GEOMETRY) failed. Error = %ld", GetLastError());
             return false;
         }
@@ -351,8 +488,9 @@ private:
     static void usage()
     {
         LogInfo(
-            "DiskGauge [-l|[-g|-b <PhysicalDriverPath>]]\n"
-            "Example: DiskGauge -g \\\\.\\PhysicalDrive3");
+            "DiskGauge [-l|-g|-b|-dd] [<PhysicalDriverPath>][<SectorIndex> <Filename>]\n"
+            "Example:\n>DiskGauge -g \\\\.\\PhysicalDrive3\n"
+            ">DiskGauge -dd \\\\.\\PhysicalDrive3 2 D:\Blob.bin\n");
     }
 
     HANDLE diskHandle;
